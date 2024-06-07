@@ -35,32 +35,33 @@
 # POSSIBILITY OF SUCH DAMAGE.
 #
 
-# use of lpod inspired by Bart Hanssens' odflinkchecker.py,
+# use of odfdo (successor of lpod) inspired by Bart Hanssens'
+# odflinkchecker.py,
 # https://lists.oasis-open.org/archives/opendocument-users/201008/msg00004.html
 # and lpod-python-recipes
 #
-import mistune
 import argparse
-import urlparse
 import codecs
-import sys
+import io
+import mistune
 import re
+import sys
+import urllib.parse
 
-from urllib import urlopen
+from urllib.request import urlopen
 from mimetypes import guess_type
 from uuid import uuid4
 
-from lpod import ODF_MANIFEST, ODF_STYLES
-from lpod.document import odf_get_document
-from lpod.frame import odf_create_text_frame, odf_create_image_frame, odf_frame
-from lpod.draw_page import odf_create_draw_page, odf_draw_page
-from lpod.list import odf_create_list_item, odf_create_list
-from lpod.style import odf_create_style
-from lpod.paragraph import odf_create_paragraph, odf_span
-from lpod.paragraph import odf_create_line_break, odf_create_spaces
-from lpod.paragraph import odf_create_tabulation
-from lpod.element import odf_create_element
-from lpod.link import odf_create_link, odf_link
+from odfdo.const import ODF_MANIFEST, ODF_STYLES
+from odfdo.document import Document
+from odfdo.frame import Frame
+from odfdo.draw_page import DrawPage
+from odfdo.list import List, ListItem
+from odfdo.style import Style
+from odfdo.paragraph import Paragraph, Span
+from odfdo.paragraph import LineBreak, Spacer
+from odfdo.paragraph import Tab
+from odfdo.link import Link
 
 from pygments.lexers import get_lexer_by_name
 from pygments.formatter import Formatter
@@ -88,15 +89,15 @@ Available master page names in template:
 
 # helper for unique hashes
 def hasher():
-    return uuid4().get_hex()
+    return uuid4()
 
 
 # helper for ODFFormatter and ODFRenderer
 def add_style(document, style_family, style_name,
               properties, parent=None):
     """Insert global style into given document"""
-    style = odf_create_style(style_family, style_name,
-                             style_name, parent)
+    style = Style(family=style_family, name=style_name,
+                  display_name=style_name, parent_style=parent)
     for elem in properties:
         # pylint: disable=maybe-no-member
         style.set_properties(properties=elem[1], area=elem[0])
@@ -109,9 +110,9 @@ def wrap_spans(odf_elements):
     res = []
     para = None
     for elem in odf_elements:
-        if isinstance(elem, odf_span) or isinstance(elem, odf_link):
+        if isinstance(elem, Span) or isinstance(elem, Link):
             if para is None:
-                para = odf_create_paragraph()
+                para = Paragraph()
             para.append(elem)
         else:
             if para is not None:
@@ -122,8 +123,9 @@ def wrap_spans(odf_elements):
         res.append(para)
     return res
 
+
 # buffer regex for tab/space splitting for block code
-_whitespace_re = re.compile(u'( {2,}|\t)', re.UNICODE)
+_whitespace_re = re.compile('( {2,}|\t)', re.UNICODE)
 
 
 def handle_whitespace(text):
@@ -139,18 +141,18 @@ def handle_whitespace(text):
             if part[:2] == '  ':
                 # multiple spaces in ODF need markup
                 result.append(
-                    odf_create_spaces(len(part)))
+                    Spacer(len(part)))
             elif part[:1] == '\t':
                 # insert an actual tab
                 result.append(
-                    odf_create_tabulation())
+                    Tab())
             else:
                 result.append(
-                    unicode(part))
+                    str(part))
 
         # for all but the last line: add linebreak
         if index < len(lines)-1:
-            result.append(odf_create_line_break())
+            result.append(LineBreak())
 
     return result
 
@@ -180,42 +182,42 @@ class ODFPartialTree:
         # TODO: kill this ugly typeswitching
         if (len(self._elements) and
             isinstance(
-                self._elements[-1], odf_draw_page) and not
+                self._elements[-1], DrawPage) and not
             isinstance(
-                elems[0], odf_draw_page)):
+                elems[0], DrawPage)):
 
             # stick additional frame content into last existing one
             for child in self._elements[-1].get_elements(
                     'descendant::draw:frame'):
-                if child.get_presentation_class() == u'outline':
-                    text_box = child.get_children()[0]
+                if child.presentation_class == 'outline':
+                    text_box = child.children[0]
                     for elem in wrap_spans(elems):
                         text_box.append(elem)
                     return
 
             # special-case image frames - append to pages literally!
-            if isinstance(elems[0], odf_frame):
+            if isinstance(elems[0], Frame):
                 for child in elems:
                     self._elements[-1].append(child)
             else:
                 # no outline frame found, create new one with elems content
                 elems = wrap_spans(elems)
                 self._elements[-1].append(
-                    odf_create_text_frame(
+                    Frame.text_frame(
                         elems,
-                        presentation_style=u'md2odp-OutlineText',
-                        size=(u'%s' % self.outline_size[0],
-                              u'%s' % self.outline_size[1]),
-                        position=(u'%s' % self.outline_position[0],
-                                  u'%s' % self.outline_position[1]),
-                        presentation_class=u'outline'))
+                        presentation_style='md2odp-OutlineText',
+                        size=('%s' % self.outline_size[0],
+                              '%s' % self.outline_size[1]),
+                        position=('%s' % self.outline_position[0],
+                                  '%s' % self.outline_position[1]),
+                        presentation_class='outline'))
         else:
             self._elements += elems
 
     def add_text(self, text):
         """Helper to ctext to self"""
-        span = odf_create_element('text:span')
-        span.set_text(unicode(text))
+        span = Span()
+        span.text = str(text)
         self._elements.append(span)
 
     def __add__(self, other):
@@ -223,7 +225,7 @@ class ODFPartialTree:
         tmp = ODFPartialTree(list(self._elements),
                              self.outline_size,
                              self.outline_position)
-        if isinstance(other, basestring):
+        if isinstance(other, str):
             tmp.add_text(other)
         else:
             tmp.add_child_elems(other.get())
@@ -231,7 +233,7 @@ class ODFPartialTree:
 
     def __iadd__(self, other):
         """Override of +="""
-        if isinstance(other, basestring):
+        if isinstance(other, str):
             self.add_text(other)
         else:
             self.add_child_elems(other.get())
@@ -256,7 +258,7 @@ class ODFFormatter(Formatter):
         Formatter.__init__(self, **options)
 
         # buffer regex for tab/space splitting for block code
-        self.whitespace_re = re.compile(u'( {2,}|\t)', re.UNICODE)
+        self.whitespace_re = re.compile('( {2,}|\t)', re.UNICODE)
 
         # create a dict of (start, end) tuples that wrap the
         # value of a token so that we can use it in the format
@@ -271,14 +273,16 @@ class ODFFormatter(Formatter):
             # a style item is a tuple in the following form:
             # colors are readily specified in hex: 'RRGGBB'
             if style['color']:
-                root_elem = curr_elem = odf_create_element('text:span')
+                root_elem = curr_elem = Span()
                 # pylint: disable=maybe-no-member
-                curr_elem.set_style('md2odp-TColor%s' % style['color'])
+                curr_elem.set_attribute(
+                  name='style',
+                  value='md2odp-TColor%s' % style['color'])
 
             if style['bold']:
-                span = odf_create_element('text:span')
+                span = Span()
                 # pylint: disable=maybe-no-member
-                span.set_style('md2odp-TBold')
+                span.set_attribute(name='style', value='md2odp-TBold')
                 if root_elem is None:
                     root_elem = curr_elem = span
                 else:
@@ -286,9 +290,9 @@ class ODFFormatter(Formatter):
                     curr_elem = span
 
             if style['italic']:
-                span = odf_create_element('text:span')
+                span = Span()
                 # pylint: disable=maybe-no-member
-                span.set_style('md2odp-TItalic')
+                span.set_attribute(name='style', value='md2odp-TItalic')
                 if root_elem is None:
                     root_elem = curr_elem = span
                 else:
@@ -296,9 +300,9 @@ class ODFFormatter(Formatter):
                     curr_elem = span
 
             if style['underline']:
-                span = odf_create_element('text:span')
+                span = Span()
                 # pylint: disable=maybe-no-member
-                span.set_style('md2odp-TUnderline')
+                span.set_attribute(name='style', value='md2odp-TUnderline')
                 if root_elem is None:
                     root_elem = curr_elem = span
                 else:
@@ -316,19 +320,19 @@ class ODFFormatter(Formatter):
             # colors are readily specified in hex: 'RRGGBB'
             if style['color']:
                 add_style(document, 'text',
-                          u'md2odp-TColor%s' % style['color'],
-                          [('text', {'color': u'#'+style['color']})])
+                          'md2odp-TColor%s' % style['color'],
+                          [('text', {'color': '#'+style['color']})])
             if style['bold']:
-                add_style(document, 'text', u'md2odp-TBold',
-                          [('text', {'font_weight': u'bold'})])
+                add_style(document, 'text', 'md2odp-TBold',
+                          [('text', {'font_weight': 'bold'})])
             if style['italic']:
-                add_style(document, 'text', u'md2odp-TItalic',
-                          [('text', {'font_style': u'italic'})])
+                add_style(document, 'text', 'md2odp-TItalic',
+                          [('text', {'font_style': 'italic'})])
             if style['underline']:
-                add_style(document, 'text', u'md2odp-TUnderline',
-                          [('text', {'text_underline_style': u'solid',
-                                     'text_underline_width': u'auto',
-                                     'text_underline_color': u'font-color'})])
+                add_style(document, 'text', 'md2odp-TUnderline',
+                          [('text', {'text_underline_style': 'solid',
+                                     'text_underline_width': 'auto',
+                                     'text_underline_color': 'font-color'})])
 
     def format(self, tokensource):
         result = []
@@ -361,17 +365,17 @@ class ODFFormatter(Formatter):
                     # white space and linefeeds: special handling
                     # needed in ODF
                     for elem in handle_whitespace(lastval):
-                        if isinstance(elem, basestring):
+                        if isinstance(elem, str):
                             if root_span is None:
-                                span = odf_create_element('text:span')
-                                span.set_text(elem)
+                                span = Span()
+                                span.text = elem
                                 result.append(span)
                             else:
                                 # this is nasty - set text in
                                 # shared style instance, clone
                                 # afterwards
-                                leaf_span.set_text(elem)
-                                result.append(root_span.clone())
+                                leaf_span.text = elem
+                                result.append(root_span.clone)
                         else:
                             result.append(elem)
 
@@ -383,14 +387,14 @@ class ODFFormatter(Formatter):
         if lastval:
             root_span, leaf_span = self.styles[lasttype]
             if root_span is None:
-                span = odf_create_element('text:span')
-                span.set_text(unicode(lastval))
+                span = Span()
+                span.text = str(lastval)
                 result.append(span)
             else:
                 # this is nasty - set text in shared style instance,
                 # clone afterwards
-                leaf_span.set_text(unicode(lastval))
-                result.append(root_span.clone())
+                leaf_span.text = str(lastval)
+                result.append(root_span.clone)
 
         return result
 
@@ -416,37 +420,37 @@ class ODFRenderer(mistune.Renderer):
         self.document = document
         self.doc_manifest = document.get_part(ODF_MANIFEST)
         self.break_master = 'Default' if break_master is None else break_master
-        self.breakheader_size = ((u'20cm', u'3cm') if breakheader_size is None
+        self.breakheader_size = (('20cm', '3cm') if breakheader_size is None
                                  else breakheader_size)
         self.breakheader_position = (
-            (u'2cm', u'8cm') if breakheader_position is None
+            ('2cm', '8cm') if breakheader_position is None
             else breakheader_position)
         self.content_master = ('Default' if content_master is None
                                else content_master)
-        self.header_size = ((u'20cm', u'3cm') if header_size is None
+        self.header_size = (('20cm', '3cm') if header_size is None
                             else header_size)
-        self.header_position = ((u'2cm', u'0.5cm') if header_position is None
+        self.header_position = (('2cm', '0.5cm') if header_position is None
                                 else header_position)
-        self.outline_size = ((u'22cm', u'12cm') if outline_size is None
+        self.outline_size = (('22cm', '12cm') if outline_size is None
                              else outline_size)
-        self.outline_position = ((u'2cm', u'4cm') if outline_position is None
+        self.outline_position = (('2cm', '4cm') if outline_position is None
                                  else outline_position)
 
         # font/char styles
         self.document.insert_style(
-            odf_create_style(
-                'font-face',
+            Style(
+                family='font-face',
                 name=code_font_name,
                 font_name=code_font_name,
                 font_family=code_font_name,
-                font_family_generic=u'modern',
-                font_pitch=u'fixed'),
+                font_family_generic='modern',
+                font_pitch='fixed'),
             automatic=True)
-        add_style(document, 'text', u'md2odp-TextEmphasisStyle',
-                  [('text', {'font_style': u'italic'})])
-        add_style(document, 'text', u'md2odp-TextDoubleEmphasisStyle',
-                  [('text', {'font_weight': u'bold'})])
-        add_style(document, 'text', u'md2odp-TextQuoteStyle',
+        add_style(document, 'text', 'md2odp-TextEmphasisStyle',
+                  [('text', {'font_style': 'italic'})])
+        add_style(document, 'text', 'md2odp-TextDoubleEmphasisStyle',
+                  [('text', {'font_weight': 'bold'})])
+        add_style(document, 'text', 'md2odp-TextQuoteStyle',
                   # TODO: font size increase does not work currently
                   # Bug in Impress:
                   # schema has his - for _all_ occurences
@@ -456,45 +460,45 @@ class ODFRenderer(mistune.Renderer):
                   #      <ref name="percent"/>
                   #    </choice>
                   #  </attribute>
-                  [('text', {'size': u'200%',
-                             'color': u'#ccf4c6'})])
-        add_style(document, 'text', u'md2odp-TextCodeStyle',
+                  [('text', {'size': '200%',
+                             'color': '#ccf4c6'})])
+        add_style(document, 'text', 'md2odp-TextCodeStyle',
                   [('text', {'style:font_name': code_font_name})])
 
         # paragraph styles
-        add_style(document, 'paragraph', u'md2odp-ParagraphQuoteStyle',
-                  [('text', {'color': u'#18a303'}),
-                   ('paragraph', {'margin_left': u'0.5cm',
-                                  'margin_right': u'0.5cm',
-                                  'margin_top': u'0.6cm',
-                                  'margin_bottom': u'0.5cm',
-                                  'text_indent': u'-0.6cm'})])
-        add_style(document, 'paragraph', u'md2odp-ParagraphCodeStyle',
+        add_style(document, 'paragraph', 'md2odp-ParagraphQuoteStyle',
+                  [('text', {'color': '#18a303'}),
+                   ('paragraph', {'margin_left': '0.5cm',
+                                  'margin_right': '0.5cm',
+                                  'margin_top': '0.6cm',
+                                  'margin_bottom': '0.5cm',
+                                  'text_indent': '-0.6cm'})])
+        add_style(document, 'paragraph', 'md2odp-ParagraphCodeStyle',
                   [('text', {'style:font_name': code_font_name}),
-                   ('paragraph', {'margin_left': u'0.5cm',
-                                  'margin_right': u'0.5cm',
-                                  'margin_top': u'0.6cm',
-                                  'margin_bottom': u'0.6cm',
-                                  'text_indent': u'0cm'})])
+                   ('paragraph', {'margin_left': '0.5cm',
+                                  'margin_right': '0.5cm',
+                                  'margin_top': '0.6cm',
+                                  'margin_bottom': '0.6cm',
+                                  'text_indent': '0cm'})])
         # graphic styles
-        add_style(document, 'graphic', u'md2odp-ImageStyle',
-                  [('graphic', {'stroke': u'none',
-                                'fille':  u'none',
-                                'draw:textarea_horizontal_align': u'right',
-                                'draw:textarea-vertical-align':   u'bottom'})])
+        add_style(document, 'graphic', 'md2odp-ImageStyle',
+                  [('graphic', {'stroke': 'none',
+                                'fille':  'none',
+                                'draw:textarea_horizontal_align': 'right',
+                                'draw:textarea-vertical-align':   'bottom'})])
 
         # presentation styles
-        add_style(document, 'presentation', u'md2odp-OutlineText',
+        add_style(document, 'presentation', 'md2odp-OutlineText',
                   ([('graphic',
-                     {'draw:fit_to_size': u'shrink-to-fit'})] if autofit_text
+                     {'draw:fit_to_size': 'shrink-to-fit'})] if autofit_text
                    else [('graphic',
-                          {'draw:auto_grow_height': u'true'})]),
+                          {'draw:auto_grow_height': 'true'})]),
                   self.content_master + '-outline1')
-        add_style(document, 'presentation', u'md2odp-TitleText',
-                  [('graphic', {'draw:auto_grow_height': u'true'})],
+        add_style(document, 'presentation', 'md2odp-TitleText',
+                  [('graphic', {'draw:auto_grow_height': 'true'})],
                   self.content_master + '-title')
-        add_style(document, 'presentation', u'md2odp-BreakTitleText',
-                  [('graphic', {'draw:auto_grow_height': u'true'})],
+        add_style(document, 'presentation', 'md2odp-BreakTitleText',
+                  [('graphic', {'draw:auto_grow_height': 'true'})],
                   self.break_master + '-title')
 
         # clone list style out of content master page (an abomination
@@ -507,12 +511,13 @@ class ODFRenderer(mistune.Renderer):
         if len(content_master_styles):
             # now stick that under custom name into automatic style section
             list_style = content_master_styles[0].get_elements(
-                'style:graphic-properties/text:list-style[1]')[0].clone()
-            list_style.set_attribute('style:name', u'OutlineListStyle')
-            document.insert_style(list_style, automatic=True)
+                'style:graphic-properties/text:list-style[1]')[0].clone
+            list_style.set_attribute('style:name', 'OutlineListStyle')
+            list_style.family = 'presentation'
+            document.insert_style(style=list_style, automatic=True)
         else:
-            print 'WARNING: no outline list style found for ' \
-                  'master page "%s"!' % self.content_master
+            print('WARNING: no outline list style found for '
+                  'master page "%s"!' % self.content_master)
 
         # delegate to pygments formatter for their styles
         self.formatter.add_style_defs(document)
@@ -521,7 +526,7 @@ class ODFRenderer(mistune.Renderer):
         return ODFPartialTree.from_metrics_provider([], self)
 
     def block_code(self, code, language=None):
-        para = odf_create_paragraph(style=u'md2odp-ParagraphCodeStyle')
+        para = Paragraph(style='md2odp-ParagraphCodeStyle')
 
         if language is not None:
             # explicit lang given, use syntax highlighting
@@ -532,9 +537,9 @@ class ODFRenderer(mistune.Renderer):
         else:
             # no lang given, use plain monospace formatting
             for elem in handle_whitespace(code):
-                if isinstance(elem, basestring):
-                    span = odf_create_element('text:span')
-                    span.set_text(elem)
+                if isinstance(elem, str):
+                    span = Span()
+                    span.text = elem
                     para.append(span)
                 else:
                     para.append(elem)
@@ -544,62 +549,62 @@ class ODFRenderer(mistune.Renderer):
     def header(self, text, level, raw=None):
         page = None
         if level == 1:
-            page = odf_create_draw_page(
+            page = DrawPage(
                 'page1',
                 name=hasher(),
                 master_page=self.break_master,
-                presentation_page_layout=u'AL3T19')
+                presentation_page_layout='AL3T19')
             page.append(
-                odf_create_text_frame(
+                Frame.text_frame(
                     wrap_spans(text.get()),
-                    presentation_style=u'md2odp-BreakTitleText',
-                    size=(u'%s' % self.breakheader_size[0],
-                          u'%s' % self.breakheader_size[1]),
-                    position=(u'%s' % self.breakheader_position[0],
-                              u'%s' % self.breakheader_position[1]),
-                    presentation_class=u'title'))
+                    presentation_style='md2odp-BreakTitleText',
+                    size=('%s' % self.breakheader_size[0],
+                          '%s' % self.breakheader_size[1]),
+                    position=('%s' % self.breakheader_position[0],
+                              '%s' % self.breakheader_position[1]),
+                    presentation_class='title'))
         elif level == 2:
-            page = odf_create_draw_page(
-                'page1',
+            page = DrawPage(
+                draw_id='page1',
                 name=hasher(),
                 master_page=self.content_master,
-                presentation_page_layout=u'AL3T1')
+                presentation_page_layout='AL3T1')
             page.append(
-                odf_create_text_frame(
+                Frame.text_frame(
                     wrap_spans(text.get()),
-                    presentation_style=u'md2odp-TitleText',
-                    size=(u'%s' % self.header_size[0],
-                          u'%s' % self.header_size[1]),
-                    position=(u'%s' % self.header_position[0],
-                              u'%s' % self.header_position[1]),
-                    presentation_class=u'title'))
+                    presentation_style='md2odp-TitleText',
+                    size=('%s' % self.header_size[0],
+                          '%s' % self.header_size[1]),
+                    position=('%s' % self.header_position[0],
+                              '%s' % self.header_position[1]),
+                    presentation_class='title'))
         else:
             raise RuntimeError('Unsupported heading level: %d' % level)
 
         return ODFPartialTree.from_metrics_provider([page], self)
 
     def block_quote(self, text):
-        para = odf_create_paragraph(style=u'md2odp-ParagraphQuoteStyle')
-        span = odf_create_element('text:span')
-        span.set_text(u'“')
+        para = Paragraph(style='md2odp-ParagraphQuoteStyle')
+        span = Span()
+        span.text = '“'
         para.append(span)
 
-        span = odf_create_element('text:span')
+        span = Span()
         for elem in text.get():
             span.append(elem)
         para.append(span)
 
-        span = odf_create_element('text:span')
-        span.set_text(u'”')
+        span = Span()
+        span.text = '”'
         para.append(span)
 
         # pylint: disable=maybe-no-member
-        para.set_span(u'md2odp-TextQuoteStyle', regex=u'“')
-        para.set_span(u'md2odp-TextQuoteStyle', regex=u'”')
+        para.set_span('md2odp-TextQuoteStyle', regex='“')
+        para.set_span('md2odp-TextQuoteStyle', regex='”')
         return ODFPartialTree.from_metrics_provider([para], self)
 
     def list_item(self, text):
-        item = odf_create_list_item()
+        item = ListItem()
         for elem in wrap_spans(text.get()):
             item.append(elem)
         return ODFPartialTree.from_metrics_provider([item], self)
@@ -607,20 +612,20 @@ class ODFRenderer(mistune.Renderer):
     def list(self, body, ordered=True):
         # TODO: reverse-engineer magic to convert outline style to
         # numbering style
-        lst = odf_create_list(style=u'L1' if ordered else u'OutlineListStyle')
+        lst = List(style='L1' if ordered else 'OutlineListStyle')
         for elem in body.get():
             lst.append(elem)
         return ODFPartialTree.from_metrics_provider([lst], self)
 
     def paragraph(self, text):
         # images? insert as standalone frame, no inline img
-        if isinstance(text.get()[0], odf_frame):
+        if isinstance(text.get()[0], Frame):
             return text
         else:
             # yes, this seem broadly illogical. but most 'paragraphs'
             # actually end up being parts of tables, quotes, list items
             # etc, which might not always permit text:p
-            span = odf_create_element('text:span')
+            span = Span()
             for elem in text.get():
                 span.append(elem)
             return ODFPartialTree.from_metrics_provider([span], self)
@@ -638,38 +643,39 @@ class ODFRenderer(mistune.Renderer):
         text = link
         if is_email:
             link = 'mailto:%s' % link
-        lnk = odf_create_link(link, text=unicode(text))
+        lnk = Link(url=link, text=str(text))
         return ODFPartialTree.from_metrics_provider([lnk], self)
 
     def link(self, link, title, content):
-        lnk = odf_create_link(link,
-                              text=content.get()[0].get_text(),
-                              title=unicode(title))
+        lnk = Link(url=link,
+                   text=content.get()[0].text,
+                   title=str(title))
         return ODFPartialTree.from_metrics_provider([lnk], self)
 
     def codespan(self, text):
-        span = odf_create_element('text:span')
+        span = Span()
         # pylint: disable=maybe-no-member
-        span.set_style('md2odp-TextCodeStyle')
-        if isinstance(text, basestring):
-            span.set_text(unicode(text))
+        span.set_attribute(name='style', value='md2odp-TextCodeStyle')
+        if isinstance(text, str):
+            span.text = str(text)
         else:
             for elem in text.get():
                 span.append(elem)
         return ODFPartialTree.from_metrics_provider([span], self)
 
     def double_emphasis(self, text):
-        span = odf_create_element('text:span')
+        span = Span()
         # pylint: disable=maybe-no-member
-        span.set_style('md2odp-TextDoubleEmphasisStyle')
+        span.set_attribute(name='style',
+                           value='md2odp-TextDoubleEmphasisStyle')
         for elem in text.get():
             span.append(elem)
         return ODFPartialTree.from_metrics_provider([span], self)
 
     def emphasis(self, text):
-        span = odf_create_element('text:span')
+        span = Span()
         # pylint: disable=maybe-no-member
-        span.set_style('md2odp-TextEmphasisStyle')
+        span.set_attribute(name='style', value='md2odp-TextEmphasisStyle')
         for elem in text.get():
             span.append(elem)
         return ODFPartialTree.from_metrics_provider([span], self)
@@ -677,7 +683,7 @@ class ODFRenderer(mistune.Renderer):
     def image(self, src, title, alt_text):
         # embed picture - TODO: optionally just link it
         media_type = guess_type(src)
-        parse = urlparse.urlparse(src)
+        parse = urllib.parse.urlparse(src)
         fragment_ext = parse[2].split('.')[-1]
         self.image_entry_id = hasher()
         fragment_name = 'Pictures/%s.%s' % (self.image_entry_id,
@@ -691,22 +697,21 @@ class ODFRenderer(mistune.Renderer):
             if not fragment_ext.endswith('svg'):
                 # delay our PIL dependency until really needed
                 from PIL import Image
-                import cStringIO
+                import io
 
-                imagefile = cStringIO.StringIO(imagedata)
+                imagefile = io.StringIO(imagedata)
 
                 # obtain image aspect ratio
                 image_w, image_h = Image.open(imagefile).size
             else:
                 # PIL does not really support svg, so let's try heuristics
                 # & find the aspect ratio ourselves
-                from BeautifulSoup import BeautifulSoup
+                from bs4 import BeautifulSoup
 
-                imagefile = BeautifulSoup(imagedata)
+                imagefile = BeautifulSoup(imagedata, features='xml')
                 image_w = float(imagefile.svg['width'])
                 image_h = float(imagefile.svg['height'])
-        except:
-            # unable to extract aspect ratio
+        except Exception:
             image_w, image_h = (100, 100)
 
         image_ratio = image_w / float(image_h)
@@ -724,16 +729,16 @@ class ODFRenderer(mistune.Renderer):
             image_h = frame_h
             frame_x += (frame_w - image_w) / 2
 
-        args = {'style': u'md2odp-ImageStyle',
-                'size': (u'%dcm' % image_w, u'%dcm' % image_h),
-                'position': (u'%dcm' % frame_x, u'%dcm' % frame_y),
-                'presentation_class': u'graphic'}
+        args = {'style': 'md2odp-ImageStyle',
+                'size': ('%dcm' % image_w, '%dcm' % image_h),
+                'position': ('%dcm' % frame_x, '%dcm' % frame_y),
+                'presentation_class': 'graphic'}
         if title is not None:
-            args['text'] = unicode(title)
-        frame = odf_create_image_frame(fragment_name, **args)
+            args['text'] = str(title)
+        frame = Frame.image_frame(fragment_name, **args)
 
         if alt_text is not None:
-            frame.set_svg_description(unicode(alt_text))
+            frame.svg_description = str(alt_text)
 
         self.doc_manifest.add_full_path(fragment_name,
                                         media_type[0])
@@ -742,7 +747,7 @@ class ODFRenderer(mistune.Renderer):
         return ODFPartialTree.from_metrics_provider([frame], self)
 
     def linebreak(self):
-        return ODFPartialTree.from_metrics_provider([odf_create_line_break()],
+        return ODFPartialTree.from_metrics_provider([LineBreak()],
                                                     self)
 
     def tag(self, html):
@@ -764,10 +769,8 @@ def main():
     parser.add_argument('input_md',
                         help='Input markdown file')
     parser.add_argument('template_odp',
-                        type=argparse.FileType('r'),
                         help='Input ODP template file')
     parser.add_argument('output_odp',
-                        type=argparse.FileType('w'),
                         help='Output ODP file')
     parser.add_argument('-p', '--page', default=-1, type=int,
                         help='Append markdown after given page. Negative '
@@ -796,11 +799,11 @@ def main():
                         ' empty or unknown name')
     args = parser.parse_args()
 
-    markdown = (codecs.getreader("utf-8")(sys.stdin) if args.input_md == '-'
-                else codecs.open(args.input_md, 'r', encoding='utf-8'))
-    odf_in = args.template_odp
-    odf_out = args.output_odp
-    presentation = odf_get_document(odf_in)
+    if args.input_md == '-':
+        markdown = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
+    else:
+        markdown = codecs.open(args.input_md, 'r', encoding='utf-8')
+    presentation = Document(args.template_odp)
 
     master_pages = presentation.get_part(ODF_STYLES).get_elements(
         'descendant::style:master-page')
@@ -810,9 +813,9 @@ def main():
         (args.content_master is not None and
          args.content_master not in master_names)):
 
-        print _master_page_spew + '\n'
+        print(_master_page_spew + '\n')
         for i in master_names:
-            print ' - ' + i
+            print(' - ' + i)
         return
 
     breakheader_size = None
@@ -850,7 +853,7 @@ def main():
                                         frame.get_attribute('svg:y'))
 
     odf_renderer = ODFRenderer(presentation,
-                               code_font_name=unicode(args.code_font_name),
+                               code_font_name=str(args.code_font_name),
                                break_master=args.break_master,
                                breakheader_size=breakheader_size,
                                breakheader_position=breakheader_position,
@@ -863,9 +866,9 @@ def main():
                                highlight_style=args.highlight_style)
     mkdown = mistune.Markdown(renderer=odf_renderer)
 
-    doc_elems = presentation.get_body()
+    doc_elems = presentation.body
     if args.page < 0:
-        args.page = len(doc_elems.get_children()) + args.page
+        args.page = len(doc_elems.children) + args.page
 
     pages = mkdown.render(markdown.read())
     if isinstance(pages, ODFPartialTree):
@@ -873,7 +876,8 @@ def main():
         for index, page in enumerate(pages.get()):
             doc_elems.insert(page, position=args.page + index)
 
-        presentation.save(target=odf_out, pretty=False)
+        presentation.save(target=args.output_odp, pretty=False)
+
 
 if __name__ == "__main__":
     main()
